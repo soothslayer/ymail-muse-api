@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "yahoo-mail": {
+      "command": "ssh",
+      "args": ["-T", "-o", "BatchMode=yes", "MAC_MINI_SSH_ALIAS", "'/ABSOLUTE/PROJECT/PATH/.venv/bin/yahoo-mail-mcp'"]
+    }
+  }
+}

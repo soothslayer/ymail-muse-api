@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yahoo-muse"
+version = "0.1.0"
+description = "Yahoo Mail tools for AI agents over MCP and SSH"
+requires-python = ">=3.10"
+dependencies = ["mcp>=1.20,<2"]
+
+[project.scripts]
+yahoo-mail = "yahoo_muse.cli:main"
+yahoo-mail-mcp = "yahoo_muse.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

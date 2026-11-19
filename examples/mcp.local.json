@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "yahoo-mail": {
+      "command": "/Users/ehanlonmiller/git/ymail-muse-api/.venv/bin/yahoo-mail-mcp",
+      "args": []
+    }
+  }
+}
