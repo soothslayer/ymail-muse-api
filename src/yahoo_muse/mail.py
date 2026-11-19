@@ -7,6 +7,7 @@ import re
 import smtplib
 import sqlite3
 import ssl
+import time
 from contextlib import contextmanager
 from datetime import date
 from email import policy
@@ -15,6 +16,7 @@ from email.parser import BytesParser
 from email.utils import formatdate, make_msgid
 
 from .config import Config, MailError
+from .sanitize import sanitize_body, sanitize_line
 
 MAX_MESSAGE_BYTES = 10 * 1024 * 1024
 
@@ -92,7 +94,7 @@ class MailService:
     def imap(self):
         client = None
         try:
-            client = imaplib.IMAP4_SSL('imap.mail.yahoo.com', 993, ssl_context=ssl.create_default_context(), timeout=30)
+            client = imaplib.IMAP4_SSL(self.config.imap_host, 993, ssl_context=ssl.create_default_context(), timeout=30)
             client.login(self.config.email, self.config.app_password)
             yield client
         except (imaplib.IMAP4.error, OSError, UnicodeError):
@@ -116,7 +118,7 @@ class MailService:
         with self.imap() as client:
             self.select(client, 'INBOX')
         try:
-            with smtplib.SMTP_SSL('smtp.mail.yahoo.com', 465, context=ssl.create_default_context(), timeout=30) as smtp:
+            with smtplib.SMTP_SSL(self.config.smtp_host, 465, context=ssl.create_default_context(), timeout=30) as smtp:
                 smtp.login(self.config.email, self.config.app_password)
         except (smtplib.SMTPException, OSError):
             raise MailError("IMAP succeeded; SMTP login failed. Check your app password and network.") from None
@@ -184,11 +186,14 @@ class MailService:
                     if isinstance(row, tuple):
                         header = BytesParser(policy=policy.default).parsebytes(row[1])
                         messages.append({"message_id": message_ref(folder, validity, uid.decode()), "folder": folder,
-                                         "from": str(header.get('From', '')), "to": str(header.get('To', '')),
-                                         "subject": str(header.get('Subject', '')), "date": str(header.get('Date', '')),
+                                         "from": sanitize_line(str(header.get('From', ''))),
+                                         "to": sanitize_line(str(header.get('To', ''))),
+                                         "subject": sanitize_line(str(header.get('Subject', ''))),
+                                         "date": sanitize_line(str(header.get('Date', ''))),
                                          "unread": b'\\Seen' not in row[0]})
             return {"messages": messages, "total_matches": len(ids), "next_offset": offset+limit if offset+limit < len(ids) else None,
-                    "order": "descending UID (usually newest first)", "content_is_untrusted": True}
+                    "order": "descending UID (usually newest first)", "content_is_untrusted": True,
+                    "sanitized": True}
 
     def read_message(self, message_id, max_chars=30000):
         bounds(max_chars, 1, 100000, 'max_chars')
@@ -210,13 +215,22 @@ class MailService:
                 raise MailError("Message missing or exceeds the read limit.")
         message = BytesParser(policy=policy.default).parsebytes(raw)
         body = message.get_body(preferencelist=('plain', 'html'))
-        text = body.get_content() if body else ''
-        attachments = [{"filename": p.get_filename(), "content_type": p.get_content_type()} for p in message.iter_attachments()]
-        return {"message_id": message_id, "from": str(message.get('From', '')), "to": str(message.get('To', '')),
-                "cc": str(message.get('Cc', '')), "subject": str(message.get('Subject', '')),
-                "date": str(message.get('Date', '')), "internet_message_id": str(message.get('Message-ID', '')),
-                "body": text[:max_chars], "body_type": body.get_content_type() if body else 'text/plain',
-                "truncated": len(text) > max_chars, "attachments": attachments, "content_is_untrusted": True}
+        raw_text = body.get_content() if body else ''
+        is_html = bool(body) and body.get_content_type() == 'text/html'
+        text, warnings = sanitize_body(raw_text, is_html=is_html)
+        truncated = len(text) > max_chars
+        text = text[:max_chars]
+        attachments = [{"filename": sanitize_line(p.get_filename() or ''), "content_type": p.get_content_type()} for p in message.iter_attachments()]
+        return {"message_id": message_id,
+                "from": sanitize_line(str(message.get('From', ''))),
+                "to": sanitize_line(str(message.get('To', ''))),
+                "cc": sanitize_line(str(message.get('Cc', ''))),
+                "subject": sanitize_line(str(message.get('Subject', ''))),
+                "date": sanitize_line(str(message.get('Date', ''))),
+                "internet_message_id": str(message.get('Message-ID', '')),
+                "body": text, "body_type": body.get_content_type() if body else 'text/plain',
+                "truncated": truncated, "attachments": attachments,
+                "content_is_untrusted": True, "sanitized": True, "warnings": warnings}
 
     @contextmanager
     def database(self):
@@ -228,11 +242,27 @@ class MailService:
         os.chmod(path, 0o600)
         db = sqlite3.connect(path, timeout=30)
         try:
-            db.execute('CREATE TABLE IF NOT EXISTS sends (key TEXT PRIMARY KEY, digest TEXT NOT NULL, result TEXT NOT NULL)')
+            db.execute('CREATE TABLE IF NOT EXISTS sends (key TEXT PRIMARY KEY, digest TEXT NOT NULL, result TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT 0)')
+            columns = [row[1] for row in db.execute('PRAGMA table_info(sends)')]
+            if 'created_at' not in columns:
+                db.execute('ALTER TABLE sends ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0')
             db.commit()
             yield db
         finally:
             db.close()
+
+    def _recent_send_count(self, db):
+        """Sends actually accepted by SMTP in the last hour (retries with a
+        stored key do not count). Used for the per-hour rate cap."""
+        since = int(time.time()) - 3600
+        count = 0
+        for (result,) in db.execute('SELECT result FROM sends WHERE created_at >= ?', (since,)):
+            try:
+                if json.loads(result).get('status') in ('accepted', 'partially_accepted'):
+                    count += 1
+            except (ValueError, TypeError, AttributeError):
+                continue
+        return count
 
     def send_status(self, idempotency_key):
         with self.database() as db:
@@ -249,6 +279,11 @@ class MailService:
         recipients = list(dict.fromkeys(a for g in groups for a in g))
         if not to or not 1 <= len(recipients) <= 50:
             raise MailError("Provide at least one to address and at most 50 recipients.")
+        blocked = [a for a in recipients if not self.config.recipient_allowed(a)]
+        if blocked:
+            raise MailError(
+                "Recipient(s) not on the allow-list (allowed_recipients in config): %s. "
+                "An empty allow-list means no restriction." % ', '.join(blocked))
         if not isinstance(subject, str) or any(c in subject for c in '\r\n') or len(subject) > 998:
             raise MailError("Subject must be a single line of at most 998 characters.")
         if not isinstance(body, str) or len(body.encode('utf-8')) > 1024 * 1024:
@@ -274,11 +309,16 @@ class MailService:
                 if old[0] != digest:
                     raise MailError("This idempotency key was already used with different content.")
                 return json.loads(old[1])
-            db.execute('INSERT INTO sends VALUES (?, ?, ?)', (idempotency_key, digest, json.dumps(result)))
+            if self._recent_send_count(db) >= self.config.max_sends_per_hour:
+                raise MailError(
+                    "Send rate limit reached: at most %d sends per hour "
+                    "(max_sends_per_hour in config)." % self.config.max_sends_per_hour)
+            db.execute('INSERT INTO sends VALUES (?, ?, ?, ?)',
+                       (idempotency_key, digest, json.dumps(result), int(time.time())))
             db.commit()
         smtp, stage = None, 'connecting'
         try:
-            smtp = smtplib.SMTP_SSL('smtp.mail.yahoo.com', 465, context=ssl.create_default_context(), timeout=30)
+            smtp = smtplib.SMTP_SSL(self.config.smtp_host, 465, context=ssl.create_default_context(), timeout=30)
             smtp.login(self.config.email, self.config.app_password)
             stage = 'submitting'
             refused = smtp.send_message(msg, from_addr=self.config.email, to_addrs=recipients)
