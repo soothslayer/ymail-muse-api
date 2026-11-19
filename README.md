@@ -7,10 +7,34 @@ SMTP with TLS for sending.
 
 ## Current status
 
-Implemented and tested locally with simulated mail servers and an actual MCP
-stdio client. Your Yahoo account is **not configured**, live Yahoo access has
-**not been tested**, and Muse's own configuration has **not been changed**.
-No email has been sent during development.
+Implemented and verified against a real Yahoo account (IMAP + SMTP via an
+app password; `doctor` passes). The bridge is in daily use by an AI agent
+over stdio MCP and the JSON CLI. See SECURITY.md for the threat model.
+
+## Security
+
+Email content is untrusted data, so everything the bridge returns is
+sanitized first (see `src/yahoo_muse/sanitize.py`): invisible/control
+characters are stripped, URLs are defanged (`hxxps[://]example[.]com`),
+markdown images/links are neutralised, tool-call-like markup is removed,
+and HTML bodies are converted to plain text with hidden elements and scripts
+dropped. Warnings in the response say what was removed. Do not reconstruct
+defanged URLs.
+
+Sending is gated by the config file:
+
+- `allowed_recipients` — optional list of fnmatch patterns (e.g.
+  `*@example.com`, `boss@partner.example`). Sends to anyone else are
+  refused. An empty list (the default) means no restriction.
+- `max_sends_per_hour` — at most this many accepted sends per hour
+  (default 10).
+
+The app password is stored as plaintext in a mode-600 config file; see
+SECURITY.md for the threat model. You can keep it out of the file with
+`app_password_env` (environment variable name) or `app_password_file`
+(path to a file containing the password) instead of `app_password`.
+The IMAP/SMTP hosts default to Yahoo's and can be overridden with
+`imap_host` / `smtp_host` if you point the bridge at another provider.
 
 ## Install on the Mac Mini
 
@@ -30,8 +54,9 @@ If you move the project, recreate the virtual environment at its new location.
 
 Generate a Yahoo app password in [Yahoo Account Security](https://login.yahoo.com/account/security).
 Run `setup` yourself in a local terminal. It asks for your email address and the
-app password with hidden input. Do not give the password to an AI or put it in a
-shell command. Yahoo may restrict app-password creation for some accounts:
+app password with hidden input, then optionally for a recipient allow-list
+(comma-separated patterns such as `*@example.com`; blank means no restriction).
+Do not give the password to an AI or put it in a shell command. Yahoo may restrict app-password creation for some accounts:
 [Yahoo's instructions](https://my.help.yahoo.com/kb/account/access-yahoo-mail-third-party-apps-sln15241.html).
 
 The credential is stored as plaintext in an owner-only file (mode 600) at
@@ -40,6 +65,16 @@ Run setup as the same macOS user Muse uses over SSH. The bridge does not log the
 password or return it in tool output. Processes running as that same user can
 read it; this is not isolation from other software on your account.
 You can choose a different path with `YAHOO_MUSE_CONFIG`.
+
+Optional keys in the same config file:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `allowed_recipients` | `[]` (no restriction) | fnmatch patterns; sends to anyone else are refused |
+| `max_sends_per_hour` | `10` | Accepted sends per hour before the server refuses |
+| `imap_host` / `smtp_host` | Yahoo's hosts | Override to point the bridge at another provider |
+| `app_password_env` | — | Read the app password from this environment variable instead |
+| `app_password_file` | — | Read the app password from this file instead |
 
 `doctor` tests both logins without sending a message. Revoking this app password
 in Yahoo disables the bridge's mail access. To change credentials, move the old
@@ -129,9 +164,10 @@ ssh -T MAC_MINI_SSH_ALIAS "'/ABSOLUTE/PROJECT/PATH/.venv/bin/yahoo-mail' search 
   Pagination is not a snapshot: incoming/deleted mail can shift results. Very
   broad searches still retrieve all matching UIDs from Yahoo before slicing.
 - Reading defaults to 30,000 characters, configurable up to 100,000, and refuses
-  messages larger than 10 MiB. Plain text is preferred; HTML-only messages return
-  raw inert HTML. Attachment metadata is included, but attachment download and
-  sending attachments are not implemented in this minimal version.
+  messages larger than 10 MiB. Plain text is preferred; HTML-only messages are
+  converted to safe plain text (hidden elements and scripts removed, images
+  replaced with `[image: ...]`). Attachment metadata is included, but attachment
+  download and sending attachments are not implemented in this minimal version.
 - Reads use read-only folder selection and `BODY.PEEK`, preserving unread status.
   IDs include folder, UIDVALIDITY, and UID. A moved/deleted message or rebuilt
   folder requires a new search.
@@ -165,8 +201,10 @@ submissions while retaining uncertainty after a crash; SMTP cannot guarantee
 exactly-once delivery. Multiple hosts with separate ledgers do not share protection.
 
 Email contents must be treated as untrusted data. Tool descriptions instruct the
-agent to send only on the user's authority. This is guidance, not a server-enforced
-human approval gate: a connected client can invoke the send tool.
+agent to send only on the user's authority, and the config's allow-list
+(`allowed_recipients`) and per-hour send cap (`max_sends_per_hour`) enforce
+bounds on sending in the server. Prompt text alone is not a security
+boundary; see SECURITY.md.
 
 ## Verification
 
